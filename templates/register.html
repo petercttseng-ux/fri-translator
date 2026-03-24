@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}註冊 - 水試所多國語音轉譯小幫手{% endblock %}
+
+{% block body %}
+<div class="auth-wrapper">
+  <div class="auth-card" style="max-width:480px">
+    <!-- Logo & Title -->
+    <div class="auth-header">
+      <img src="{{ url_for('static', filename='images/logo.jpg') }}" alt="農業部水產試驗所" class="auth-logo" />
+      <h1 class="auth-title">建立帳號</h1>
+      <p class="auth-subtitle">水試所多國語音轉譯小幫手</p>
+    </div>
+
+    {% if error %}
+    <div class="alert alert-danger alert-dismissible fade show" role="alert">
+      <i class="bi bi-exclamation-triangle-fill me-2"></i>{{ error }}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('register') }}" class="auth-form">
+      <div class="form-floating mb-3">
+        <input type="text" class="form-control" id="username" name="username"
+               placeholder="帳號" required minlength="3" maxlength="30"
+               autocomplete="username" />
+        <label for="username"><i class="bi bi-person me-1"></i>帳號</label>
+      </div>
+      <div class="form-floating mb-3">
+        <input type="email" class="form-control" id="email" name="email"
+               placeholder="電子郵件" required autocomplete="email" />
+        <label for="email"><i class="bi bi-envelope me-1"></i>電子郵件</label>
+      </div>
+      <div class="form-floating mb-3">
+        <input type="password" class="form-control" id="password" name="password"
+               placeholder="密碼" required minlength="6"
+               autocomplete="new-password" />
+        <label for="password"><i class="bi bi-lock me-1"></i>密碼（至少 6 個字元）</label>
+      </div>
+      <div class="form-floating mb-4">
+        <input type="password" class="form-control" id="confirm_password" name="confirm_password"
+               placeholder="確認密碼" required minlength="6"
+               autocomplete="new-password" />
+        <label for="confirm_password"><i class="bi bi-lock-fill me-1"></i>確認密碼</label>
+      </div>
+      <button type="submit" class="btn btn-primary w-100 btn-auth">
+        <i class="bi bi-person-plus me-2"></i>立即註冊
+      </button>
+    </form>
+
+    <div class="auth-footer">
+      <p>已有帳號？<a href="{{ url_for('login') }}">返回登入</a></p>
+    </div>
+  </div>
+
+  <div class="auth-bg-decoration">
+    <div class="bubble b1"></div>
+    <div class="bubble b2"></div>
+    <div class="bubble b3"></div>
+  </div>
+</div>
+{% endblock %}

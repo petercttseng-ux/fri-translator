@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}登入 - 水試所多國語音轉譯小幫手{% endblock %}
+
+{% block body %}
+<div class="auth-wrapper">
+  <div class="auth-card">
+    <!-- Logo & Title -->
+    <div class="auth-header">
+      <img src="{{ url_for('static', filename='images/logo.jpg') }}" alt="農業部水產試驗所" class="auth-logo" />
+      <h1 class="auth-title">水試所多國語音轉譯小幫手</h1>
+      <p class="auth-subtitle">農業部水產試驗所 · Fisheries Research Institute</p>
+    </div>
+
+    <!-- Alerts -->
+    {% if success %}
+    <div class="alert alert-success alert-dismissible fade show" role="alert">
+      <i class="bi bi-check-circle-fill me-2"></i>{{ success }}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
+    {% if error %}
+    <div class="alert alert-danger alert-dismissible fade show" role="alert">
+      <i class="bi bi-exclamation-triangle-fill me-2"></i>{{ error }}
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endif %}
+
+    <!-- Form -->
+    <form method="POST" action="{{ url_for('login') }}" class="auth-form">
+      <div class="form-floating mb-3">
+        <input type="text" class="form-control" id="username" name="username"
+               placeholder="帳號" required autocomplete="username" />
+        <label for="username"><i class="bi bi-person me-1"></i>帳號</label>
+      </div>
+      <div class="form-floating mb-3">
+        <input type="password" class="form-control" id="password" name="password"
+               placeholder="密碼" required autocomplete="current-password" />
+        <label for="password"><i class="bi bi-lock me-1"></i>密碼</label>
+      </div>
+      <button type="submit" class="btn btn-primary w-100 btn-auth">
+        <i class="bi bi-box-arrow-in-right me-2"></i>登入
+      </button>
+    </form>
+
+    <div class="auth-footer">
+      <p>還沒有帳號？<a href="{{ url_for('register') }}">立即註冊</a></p>
+    </div>
+  </div>
+
+  <!-- Background decoration -->
+  <div class="auth-bg-decoration">
+    <div class="bubble b1"></div>
+    <div class="bubble b2"></div>
+    <div class="bubble b3"></div>
+  </div>
+</div>
+{% endblock %}
