@@ -253,21 +253,25 @@ function renderSummary(text) {
 
 function showResults(data) {
   STATE.resultData = data;
-  $('resultsPanel').classList.remove('d-none');
 
   const orig = data.original  || data.orig_text || '';
   const zh   = data.translations?.zh || data.zh_text || '';
   const en   = data.translations?.en || data.en_text || '';
   const ja   = data.translations?.ja || data.ja_text || '';
 
-  // 同步填入全部四欄
+  // ── 強制所有欄都顯示（不受語言勾選影響），再填入內容 ──
+  ['resultCardZh','resultCardEn','resultCardJa'].forEach(id => {
+    const el = $(id);
+    if (el) el.style.display = '';
+  });
+
   setColContent('colOrig', orig);
   setColContent('colZh',   zh);
   setColContent('colEn',   en);
   setColContent('colJa',   ja);
 
-  // 依語言選擇隱藏未勾選的欄
-  syncLangColVisibility();
+  // 顯示結果面板（必須在 setColContent 之後）
+  $('resultsPanel').classList.remove('d-none');
 
   if (data.summary) {
     renderSummary(data.summary);
@@ -282,7 +286,7 @@ function showResults(data) {
   updateWordCount(orig);
   STATE.statCount++;
   $('statCount').textContent = STATE.statCount;
-  $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setTimeout(() => $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
 }
 
 // ─────────────────────────────────────────────
@@ -491,6 +495,10 @@ function stopRecording() {
   $('waveformCanvas').style.display = 'none';
 
   if (STATE.accTranscript) {
+    // 強制顯示全部即時翻譯欄位
+    ['rtCardZh','rtCardEn','rtCardJa'].forEach(id => {
+      const el = $(id); if (el) el.style.display = '';
+    });
     showResults({ original: STATE.accTranscript, translations: STATE.accTranslations });
   }
 }

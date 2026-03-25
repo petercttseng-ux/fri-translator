@@ -23,16 +23,25 @@ import secrets
 import base64
 import threading
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(BASE_DIR, 'instance', 'users.db')
+
+# ── 持久化 secret_key（寫入 instance/secret.key，重啟後不變）──
+def _load_secret_key():
+    key_file = os.path.join(BASE_DIR, 'instance', 'secret.key')
+    os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    if os.path.exists(key_file):
+        with open(key_file, 'r') as f:
+            return f.read().strip()
+    key = secrets.token_hex(32)
+    with open(key_file, 'w') as f:
+        f.write(key)
+    return key
+
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-# 使用 threading 模式，避免 eventlet 干擾 SQLite
+app.secret_key = os.environ.get('SECRET_KEY') or _load_secret_key()
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
                     logger=False, engineio_logger=False)
-
-DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance', 'users.db')
-
-# SQLite thread-local storage
-_db_local = threading.local()
 
 
 # ─────────────────────────────────────────────
@@ -40,12 +49,12 @@ _db_local = threading.local()
 # ─────────────────────────────────────────────
 
 def get_db():
-    """每個請求使用獨立連線，check_same_thread=False 允許多執行緒存取"""
-    conn = sqlite3.connect(DATABASE, check_same_thread=False,
-                           timeout=30, isolation_level=None)
+    """每個請求使用獨立連線，WAL 模式支援多執行緒讀寫"""
+    conn = sqlite3.connect(DATABASE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # 提升並發性能
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -177,53 +186,61 @@ def do_translate(client: Groq, text: str, target_lang: str) -> str:
     if not text.strip():
         return ''
     lang_name = LANG_NAMES.get(target_lang, target_lang)
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                'role': 'system',
-                'content': (
-                    f'You are a professional translator. '
-                    f'Translate the following text into {lang_name}. '
-                    'Return only the translation, without any explanation or prefix.'
-                ),
-            },
-            {'role': 'user', 'content': text},
-        ],
-        max_tokens=4096,
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    'role': 'system',
+                    'content': (
+                        f'You are a professional translator. '
+                        f'Translate the following text into {lang_name}. '
+                        'Return only the translation, without any explanation or prefix.'
+                    ),
+                },
+                {'role': 'user', 'content': text},
+            ],
+            max_tokens=4096,
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logging.warning(f'Translation to {target_lang} failed: {e}')
+        return f'[翻譯失敗: {str(e)[:80]}]'
 
 
 def do_summarize(client: Groq, text: str) -> str:
     if not text.strip():
         return ''
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {
-                'role': 'system',
-                'content': (
-                    '你是專業的文件摘要助手，請對以下逐字稿進行重點摘要。\n'
-                    '回覆格式：\n'
-                    '## 📋 重點摘要\n'
-                    '• [重點1]\n'
-                    '• [重點2]\n'
-                    '（依內容多寡調整，3-8點）\n\n'
-                    '## 🔑 關鍵詞\n'
-                    '[詞1]、[詞2]、[詞3]…\n\n'
-                    '## 📊 主題分類\n'
-                    '[分類]\n\n'
-                    '請使用繁體中文回覆。'
-                ),
-            },
-            {'role': 'user', 'content': text},
-        ],
-        max_tokens=1024,
-        temperature=0.5,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    'role': 'system',
+                    'content': (
+                        '你是專業的文件摘要助手，請對以下逐字稿進行重點摘要。\n'
+                        '回覆格式：\n'
+                        '## 📋 重點摘要\n'
+                        '• [重點1]\n'
+                        '• [重點2]\n'
+                        '（依內容多寡調整，3-8點）\n\n'
+                        '## 🔑 關鍵詞\n'
+                        '[詞1]、[詞2]、[詞3]…\n\n'
+                        '## 📊 主題分類\n'
+                        '[分類]\n\n'
+                        '請使用繁體中文回覆。'
+                    ),
+                },
+                {'role': 'user', 'content': text},
+            ],
+            max_tokens=1024,
+            temperature=0.5,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logging.warning(f'Summarize failed: {e}')
+        return f'[摘要生成失敗: {str(e)[:80]}]'
 
 
 # ─────────────────────────────────────────────
@@ -240,25 +257,27 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
+        identifier = request.form.get('username', '').strip()  # 接受帳號或 Email
+        password   = request.form.get('password', '')
 
-        if not username or not password:
+        if not identifier or not password:
             return render_template('login.html', error='請填寫所有欄位')
 
         conn = get_db()
+        # 同時支援帳號名稱 或 Email 登入
         user = conn.execute(
-            'SELECT * FROM users WHERE username = ?', (username,)
+            'SELECT * FROM users WHERE username = ? OR email = ?',
+            (identifier, identifier)
         ).fetchone()
         conn.close()
 
         if user and user['password'] == hash_password(password):
             session.clear()
-            session['user_id'] = user['id']
+            session['user_id']  = user['id']
             session['username'] = user['username']
             return redirect(url_for('dashboard'))
 
-        return render_template('login.html', error='帳號或密碼錯誤')
+        return render_template('login.html', error='帳號／Email 或密碼錯誤，請確認後重試')
 
     return render_template('login.html', success=request.args.get('success'))
 
