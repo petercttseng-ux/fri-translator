@@ -13,17 +13,20 @@ const STATE = {
   currentTab:      'realtime',
   currentLang:     'orig',
   isRecording:     false,
-  mediaRecorder:   null,
-  audioChunks:     [],
   recInterval:     null,
   recSeconds:      0,
-  accTranscript:   '',   // accumulated real-time transcript
+  segmentTimer:    null,
+  accTranscript:   '',
   accTranslations: { zh: '', en: '', ja: '' },
   resultData:      null,
   currentRecId:    null,
   statCount:       0,
+  // Audio pipeline
+  stream:          null,
   audioCtx:        null,
   analyser:        null,
+  scriptProc:      null,
+  pcmBuffer:       [],   // Float32Array[] — 每段 PCM 資料
   animId:          null,
 };
 
@@ -48,8 +51,11 @@ socket.on('transcription_result', data => {
       STATE.accTranslations[lang] += (STATE.accTranslations[lang] ? '\n' : '') + data.translations[lang];
     }
   }
-  // Update live display
-  $('rtTranscript').textContent = STATE.accTranscript || '…';
+  // 同步更新全部四欄
+  setColContent('rtColOrig', STATE.accTranscript);
+  setColContent('rtColZh',   STATE.accTranslations.zh);
+  setColContent('rtColEn',   STATE.accTranslations.en);
+  setColContent('rtColJa',   STATE.accTranslations.ja);
   updateWordCount(STATE.accTranscript);
   showToast('收到新片段轉譯結果', 'info');
 });
@@ -175,28 +181,64 @@ $('showHistoryBtn').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────
-// Language tab (results)
+// 多欄文字設定（含閃爍動畫）
 // ─────────────────────────────────────────────
-$$('.result-lang-tabs .nav-link').forEach(btn => {
-  btn.addEventListener('click', () => {
-    $$('.result-lang-tabs .nav-link').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    STATE.currentLang = btn.dataset.lang;
-    renderLangContent();
-  });
-});
-
-function renderLangContent() {
-  if (!STATE.resultData) return;
-  const d = STATE.resultData;
-  const map = {
-    orig: d.original || d.orig_text || '',
-    zh:   d.translations?.zh || d.zh_text || '',
-    en:   d.translations?.en || d.en_text || '',
-    ja:   d.translations?.ja || d.ja_text || '',
-  };
-  $('langContent').textContent = map[STATE.currentLang] || '（無內容）';
+function setColContent(id, text) {
+  const el = $(id);
+  if (!el) return;
+  if (text && text.trim()) {
+    el.textContent = text;
+    el.classList.remove('updating');
+    void el.offsetWidth; // 重置動畫
+    el.classList.add('updating');
+  } else {
+    el.innerHTML = '<span class="text-muted fst-italic">（無內容）</span>';
+  }
 }
+
+// 單欄複製（供 HTML onclick 呼叫）
+function copyColContent(id) {
+  const el = $(id);
+  if (!el) return;
+  const text = el.textContent?.trim() || '';
+  if (!text || text === '（無內容）' || text === '(No content yet)' || text.includes('將在此')) {
+    showToast('尚無文字可複製', 'warning');
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => {
+    showToast('已複製到剪貼簿 ✓', 'success');
+  }).catch(() => {
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('已複製到剪貼簿 ✓', 'success');
+  });
+}
+
+// 依語言選擇顯示/隱藏欄位
+function syncLangColVisibility() {
+  const langs = getSelectedLangs();
+  // 即時錄音欄
+  const rtZh = $('rtCardZh'); const rtEn = $('rtCardEn'); const rtJa = $('rtCardJa');
+  if (rtZh) rtZh.style.display = langs.includes('zh') ? '' : 'none';
+  if (rtEn) rtEn.style.display = langs.includes('en') ? '' : 'none';
+  if (rtJa) rtJa.style.display = langs.includes('ja') ? '' : 'none';
+  // 結果欄
+  const rZh = $('resultCardZh'); const rEn = $('resultCardEn'); const rJa = $('resultCardJa');
+  if (rZh) rZh.style.display = langs.includes('zh') ? '' : 'none';
+  if (rEn) rEn.style.display = langs.includes('en') ? '' : 'none';
+  if (rJa) rJa.style.display = langs.includes('ja') ? '' : 'none';
+}
+
+// 監聽語言勾選變化
+$$('.lang-checks input').forEach(cb => {
+  cb.addEventListener('change', syncLangColVisibility);
+});
+syncLangColVisibility(); // 初始化
 
 function renderSummary(text) {
   const box = $('summaryContent');
@@ -213,12 +255,19 @@ function showResults(data) {
   STATE.resultData = data;
   $('resultsPanel').classList.remove('d-none');
 
-  // Reset lang tabs
-  $$('.result-lang-tabs .nav-link').forEach(b => {
-    b.classList.toggle('active', b.dataset.lang === 'orig');
-  });
-  STATE.currentLang = 'orig';
-  renderLangContent();
+  const orig = data.original  || data.orig_text || '';
+  const zh   = data.translations?.zh || data.zh_text || '';
+  const en   = data.translations?.en || data.en_text || '';
+  const ja   = data.translations?.ja || data.ja_text || '';
+
+  // 同步填入全部四欄
+  setColContent('colOrig', orig);
+  setColContent('colZh',   zh);
+  setColContent('colEn',   en);
+  setColContent('colJa',   ja);
+
+  // 依語言選擇隱藏未勾選的欄
+  syncLangColVisibility();
 
   if (data.summary) {
     renderSummary(data.summary);
@@ -230,7 +279,7 @@ function showResults(data) {
       </div>`;
   }
 
-  updateWordCount(data.original || data.orig_text || '');
+  updateWordCount(orig);
   STATE.statCount++;
   $('statCount').textContent = STATE.statCount;
   $('resultsPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -251,118 +300,255 @@ $('btnStopRec').addEventListener('click', stopRecording);
 $('btnClearRt').addEventListener('click', () => {
   STATE.accTranscript   = '';
   STATE.accTranslations = { zh: '', en: '', ja: '' };
-  $('rtTranscript').innerHTML = '<span class="text-muted fst-italic">逐字稿將在此即時顯示…</span>';
+  // 清除全部即時欄
+  const placeholders = {
+    rtColOrig: '逐字稿將在此即時顯示…',
+    rtColZh:   '中文譯文將在此顯示…',
+    rtColEn:   'English translation will appear here…',
+    rtColJa:   '日本語訳はここに表示されます…',
+  };
+  for (const [id, txt] of Object.entries(placeholders)) {
+    const el = $(id);
+    if (el) el.innerHTML = `<span class="text-muted fst-italic">${txt}</span>`;
+  }
   $('resultsPanel').classList.add('d-none');
   updateWordCount('');
 });
+
+// ═══════════════════════════════════════════════
+// WAV 編碼工具（純 JS，無需外部套件）
+// ═══════════════════════════════════════════════
+function _writeStr(view, offset, str) {
+  for (let i = 0; i < str.length; i++)
+    view.setUint8(offset + i, str.charCodeAt(i));
+}
+function _pcmToInt16(view, offset, pcm) {
+  for (let i = 0; i < pcm.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+}
+/**
+ * Float32Array PCM → WAV Blob（audio/wav）
+ * Groq Whisper 100% 支援 WAV 格式
+ */
+function encodeWAV(pcm, sampleRate) {
+  const dataLen = pcm.length * 2;
+  const buf     = new ArrayBuffer(44 + dataLen);
+  const v       = new DataView(buf);
+  _writeStr(v, 0,  'RIFF');
+  v.setUint32 (4,  36 + dataLen, true);
+  _writeStr(v, 8,  'WAVE');
+  _writeStr(v, 12, 'fmt ');
+  v.setUint32 (16, 16,         true);  // chunk size
+  v.setUint16 (20, 1,          true);  // PCM
+  v.setUint16 (22, 1,          true);  // mono
+  v.setUint32 (24, sampleRate, true);
+  v.setUint32 (28, sampleRate * 2, true);
+  v.setUint16 (32, 2,          true);  // block align
+  v.setUint16 (34, 16,         true);  // bits/sample
+  _writeStr(v, 36, 'data');
+  v.setUint32 (40, dataLen,    true);
+  _pcmToInt16(v, 44, pcm);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// ═══════════════════════════════════════════════
+// 即時錄音（Web Audio API → PCM → WAV → HTTP POST）
+// ═══════════════════════════════════════════════
+const RT_SAMPLE_RATE = 16000;   // 16kHz — Whisper 最佳輸入取樣率
+const SEGMENT_SECS   = 9;       // 每 9 秒送出一段
 
 async function startRecording() {
   if (!STATE.apiKey) {
     new bootstrap.Modal($('apiKeyModal')).show();
     return;
   }
-
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    setupWaveform(stream);
-
-    STATE.isRecording    = true;
-    STATE.audioChunks    = [];
-    STATE.accTranscript  = '';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+    });
+    STATE.stream      = stream;
+    STATE.isRecording = true;
+    STATE.pcmBuffer   = [];
+    STATE.accTranscript   = '';
     STATE.accTranslations = { zh: '', en: '', ja: '' };
-    STATE.recSeconds     = 0;
+    STATE.recSeconds      = 0;
 
-    $('rtTranscript').textContent = '';
+    // 清空四欄
+    ['rtColOrig','rtColZh','rtColEn','rtColJa'].forEach(id => {
+      const el = $(id);
+      if (el) el.innerHTML = '<span class="text-muted fst-italic">等待語音輸入…</span>';
+    });
+
     $('rtLiveBadge').classList.remove('d-none');
     $('btnStartRec').classList.add('d-none');
     $('btnStopRec').classList.remove('d-none');
     $('rtStatus').textContent = '錄音中';
     $('rtStatus').className   = 'badge bg-danger';
     $('rtTimer').classList.remove('d-none');
-    $('waveformIdle').style.display = 'none';
+    $('waveformIdle').style.display  = 'none';
     $('waveformCanvas').style.display = 'block';
 
-    // Timer
+    // 計時器
     STATE.recInterval = setInterval(() => {
       STATE.recSeconds++;
-      const m = String(Math.floor(STATE.recSeconds / 60)).padStart(2, '0');
-      const s = String(STATE.recSeconds % 60).padStart(2, '0');
+      const m = String(Math.floor(STATE.recSeconds / 60)).padStart(2,'0');
+      const s = String(STATE.recSeconds % 60).padStart(2,'0');
       $('rtTimer').textContent = `${m}:${s}`;
     }, 1000);
 
-    // MediaRecorder - send chunk every 8 seconds
-    const mimeType = getSupportedMimeType();
-    STATE.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    // ── AudioContext（共用：錄音 + 波形）──
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    STATE.audioCtx  = new AudioCtx();
+    const srcNode   = STATE.audioCtx.createMediaStreamSource(stream);
 
-    STATE.mediaRecorder.ondataavailable = e => {
-      if (e.data && e.data.size > 0) {
-        STATE.audioChunks.push(e.data);
-        sendChunk(e.data);
+    // 波形分析器
+    STATE.analyser = STATE.audioCtx.createAnalyser();
+    STATE.analyser.fftSize = 256;
+    srcNode.connect(STATE.analyser);
+
+    // ScriptProcessor 捕捉 PCM（已標記棄用但各瀏覽器仍完整支援）
+    const bufSize    = 4096;
+    STATE.scriptProc = STATE.audioCtx.createScriptProcessor(bufSize, 1, 1);
+    const nativeSR   = STATE.audioCtx.sampleRate;
+    const ratio      = nativeSR / RT_SAMPLE_RATE;
+
+    STATE.scriptProc.onaudioprocess = e => {
+      if (!STATE.isRecording) return;
+      const raw = e.inputBuffer.getChannelData(0);
+      // 降取樣至 16kHz
+      if (ratio > 1.01) {
+        const len = Math.floor(raw.length / ratio);
+        const ds  = new Float32Array(len);
+        for (let i = 0; i < len; i++) ds[i] = raw[Math.round(i * ratio)];
+        STATE.pcmBuffer.push(ds);
+      } else {
+        STATE.pcmBuffer.push(new Float32Array(raw));
       }
     };
 
-    STATE.mediaRecorder.start(8000); // timeslice: 8s
+    srcNode.connect(STATE.scriptProc);
+    STATE.scriptProc.connect(STATE.audioCtx.destination);   // 靜音輸出（必須連接才能觸發）
+
+    drawWaveform();
+
+    // 定時送出分段
+    STATE.segmentTimer = setInterval(() => {
+      if (STATE.isRecording) flushSegment();
+    }, SEGMENT_SECS * 1000);
 
   } catch (err) {
+    STATE.isRecording = false;
     showToast('無法存取麥克風：' + err.message, 'danger');
   }
+}
+
+/** 合併 pcmBuffer → WAV → HTTP POST */
+function flushSegment() {
+  if (!STATE.pcmBuffer || STATE.pcmBuffer.length === 0) return;
+
+  const totalLen = STATE.pcmBuffer.reduce((s, a) => s + a.length, 0);
+  if (totalLen < RT_SAMPLE_RATE * 0.8) return;   // < 0.8 秒跳過
+
+  const merged = new Float32Array(totalLen);
+  let off = 0;
+  for (const chunk of STATE.pcmBuffer) { merged.set(chunk, off); off += chunk.length; }
+  STATE.pcmBuffer = [];
+
+  const wavBlob = encodeWAV(merged, RT_SAMPLE_RATE);
+  sendChunkHTTP(wavBlob);   // 非同步，不等待
 }
 
 function stopRecording() {
   if (!STATE.isRecording) return;
   STATE.isRecording = false;
 
-  if (STATE.mediaRecorder && STATE.mediaRecorder.state !== 'inactive') {
-    STATE.mediaRecorder.stop();
-    STATE.mediaRecorder.stream.getTracks().forEach(t => t.stop());
-  }
-
+  clearInterval(STATE.segmentTimer); STATE.segmentTimer = null;
   clearInterval(STATE.recInterval);
-  stopWaveform();
+
+  // 送出最後剩餘片段
+  flushSegment();
+
+  // 釋放 ScriptProcessor
+  if (STATE.scriptProc) { STATE.scriptProc.disconnect(); STATE.scriptProc = null; }
+
+  // 關閉 AudioContext
+  if (STATE.audioCtx)  { STATE.audioCtx.close(); STATE.audioCtx = null; }
+  STATE.analyser = null;
+
+  // 停止麥克風
+  if (STATE.stream) { STATE.stream.getTracks().forEach(t => t.stop()); STATE.stream = null; }
+
+  if (STATE.animId) { cancelAnimationFrame(STATE.animId); STATE.animId = null; }
 
   $('btnStartRec').classList.remove('d-none');
   $('btnStopRec').classList.add('d-none');
   $('rtStatus').textContent = '已停止';
   $('rtStatus').className   = 'badge bg-secondary';
   $('rtLiveBadge').classList.add('d-none');
-  $('waveformIdle').style.display = '';
+  $('waveformIdle').style.display   = '';
   $('waveformCanvas').style.display = 'none';
 
-  // Build result from accumulated data
   if (STATE.accTranscript) {
-    const data = {
-      original: STATE.accTranscript,
-      translations: STATE.accTranslations,
-    };
-    showResults(data);
+    showResults({ original: STATE.accTranscript, translations: STATE.accTranslations });
   }
 }
 
-function sendChunk(blob) {
-  const reader = new FileReader();
-  reader.onloadend = () => {
-    const b64 = reader.result.split(',')[1];
-    socket.emit('audio_chunk', {
-      api_key:   STATE.apiKey,
-      audio:     b64,
-      languages: getSelectedLangs(),
-    });
-  };
-  reader.readAsDataURL(blob);
+/** HTTP POST 上傳 WAV 分段 */
+async function sendChunkHTTP(blob) {
+  try {
+    if (STATE.isRecording) {
+      $('rtStatus').textContent = '轉譯中…';
+      $('rtStatus').className   = 'badge bg-warning text-dark';
+    }
+
+    const form = new FormData();
+    form.append('file',      blob, 'chunk.wav');
+    form.append('api_key',   STATE.apiKey);
+    form.append('languages', getSelectedLangs().join(','));
+
+    const res  = await fetch('/api/transcribe_rt', { method: 'POST', body: form });
+    const data = await res.json();
+
+    if (data.error && !data.skip) {
+      showToast('⚠️ ' + data.error, 'danger');
+      return;
+    }
+
+    const text = (data.text || '').trim();
+    if (text) {
+      STATE.accTranscript += (STATE.accTranscript ? '\n' : '') + text;
+      setColContent('rtColOrig', STATE.accTranscript);
+      updateWordCount(STATE.accTranscript);
+    }
+
+    for (const [lang, val] of Object.entries(data.translations || {})) {
+      if (val && val.trim()) {
+        STATE.accTranslations[lang] = STATE.accTranslations[lang]
+          ? STATE.accTranslations[lang] + '\n' + val : val;
+        const colMap = { zh:'rtColZh', en:'rtColEn', ja:'rtColJa' };
+        if (colMap[lang]) setColContent(colMap[lang], STATE.accTranslations[lang]);
+      }
+    }
+
+    if (text) showToast(`[${data.timestamp || ''}] 片段轉譯完成 ✓`, 'success');
+
+  } catch (err) {
+    showToast('傳送失敗：' + err.message, 'danger');
+  } finally {
+    if (STATE.isRecording) {
+      $('rtStatus').textContent = '錄音中';
+      $('rtStatus').className   = 'badge bg-danger';
+    }
+  }
 }
 
-function getSupportedMimeType() {
-  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
-  return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
-}
-
-// Waveform visualizer
+// ─────────────────────────────────────────────
+// 波形視覺化（共用同一個 audioCtx）
+// ─────────────────────────────────────────────
 function setupWaveform(stream) {
-  STATE.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  STATE.analyser  = STATE.audioCtx.createAnalyser();
-  STATE.analyser.fftSize = 256;
-  const source = STATE.audioCtx.createMediaStreamSource(stream);
-  source.connect(STATE.analyser);
+  // 已在 startRecording 建立 audioCtx 與 analyser，這裡僅啟動繪製
   drawWaveform();
 }
 
@@ -399,8 +585,8 @@ function drawWaveform() {
 }
 
 function stopWaveform() {
-  if (STATE.animId)  { cancelAnimationFrame(STATE.animId); STATE.animId = null; }
-  if (STATE.audioCtx) { STATE.audioCtx.close(); STATE.audioCtx = null; }
+  // audioCtx 由 stopRecording 負責關閉，這裡僅停止動畫
+  if (STATE.animId) { cancelAnimationFrame(STATE.animId); STATE.animId = null; }
 }
 
 // ─────────────────────────────────────────────
@@ -545,14 +731,18 @@ $('btnAiSummary').addEventListener('click', async () => {
 $('btnCopyAll').addEventListener('click', () => {
   if (!STATE.resultData) return;
   const d = STATE.resultData;
-  const text = [
-    '【原始逐字稿】\n' + (d.original || d.orig_text || ''),
-    '【中文翻譯】\n'   + (d.translations?.zh || d.zh_text || ''),
-    '【English】\n'    + (d.translations?.en || d.en_text || ''),
-    '【日本語】\n'     + (d.translations?.ja || d.ja_text || ''),
-  ].join('\n\n');
+  // 只輸出有內容的欄位
+  const sections = [
+    ['原始逐字稿',   d.original  || d.orig_text || ''],
+    ['繁體中文翻譯', d.translations?.zh || d.zh_text || ''],
+    ['English',      d.translations?.en || d.en_text || ''],
+    ['日本語翻訳',   d.translations?.ja || d.ja_text || ''],
+  ].filter(([, v]) => v.trim());
+  const text = sections
+    .map(([label, val]) => `【${label}】\n${val}`)
+    .join('\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n');
   navigator.clipboard.writeText(text)
-    .then(() => showToast('已複製至剪貼簿', 'success'))
+    .then(() => showToast('已複製所有語言內容 ✓', 'success'))
     .catch(() => showToast('複製失敗', 'danger'));
 });
 
@@ -688,7 +878,7 @@ window.loadHistoryItem = async function(id) {
     });
     $$('.tab-pane-content').forEach(p => p.classList.add('d-none'));
     $('tab-realtime').classList.remove('d-none');
-    $('rtTranscript').textContent = item.orig_text || '';
+    setColContent('rtColOrig', item.orig_text || '');
     showResults(STATE.resultData);
     showToast('已載入歷史記錄 #' + id, 'info');
   } catch (err) {

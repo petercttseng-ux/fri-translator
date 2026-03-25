@@ -4,6 +4,12 @@
 Multilingual Speech Translation Assistant
 """
 
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+)
+
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, make_response
 from flask_socketio import SocketIO, emit
 import sqlite3
@@ -15,12 +21,18 @@ from groq import Groq
 from datetime import datetime
 import secrets
 import base64
+import threading
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# 使用 threading 模式，避免 eventlet 干擾 SQLite
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
+                    logger=False, engineio_logger=False)
 
-DATABASE = 'instance/users.db'
+DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance', 'users.db')
+
+# SQLite thread-local storage
+_db_local = threading.local()
 
 
 # ─────────────────────────────────────────────
@@ -28,13 +40,17 @@ DATABASE = 'instance/users.db'
 # ─────────────────────────────────────────────
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
+    """每個請求使用獨立連線，check_same_thread=False 允許多執行緒存取"""
+    conn = sqlite3.connect(DATABASE, check_same_thread=False,
+                           timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # 提升並發性能
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
 def init_db():
-    os.makedirs('instance', exist_ok=True)
+    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
     conn = get_db()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
@@ -59,6 +75,34 @@ def init_db():
     )''')
     conn.commit()
     conn.close()
+
+
+# ─────────────────────────────────────────────
+# App lifecycle
+# ─────────────────────────────────────────────
+
+_db_initialized = False
+
+@app.before_request
+def ensure_db_initialized():
+    global _db_initialized
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
+
+@app.errorhandler(500)
+def internal_error(e):
+    logging.exception("Internal Server Error: %s", e)
+    return render_template('error.html', error=str(e)), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logging.exception("Unhandled Exception: %s", e)
+    import traceback
+    err_msg = traceback.format_exc()
+    if app.debug:
+        return f"<pre>ERROR:\n{err_msg}</pre>", 500
+    return render_template('error.html', error=str(e)), 500
 
 
 # ─────────────────────────────────────────────
@@ -96,10 +140,34 @@ WHISPER_TURBO = 'whisper-large-v3-turbo'
 
 def do_transcribe(client: Groq, file_path: str, fast: bool = False) -> str:
     model = WHISPER_TURBO if fast else WHISPER_MODEL
+
+    # 檔案大小驗證
+    file_size = os.path.getsize(file_path)
+    if file_size < 200:
+        raise ValueError(f'音訊檔案過小（{file_size} bytes），可能是空白或靜音錄音，請確認麥克風是否正常')
+    if file_size > 25 * 1024 * 1024:
+        raise ValueError('音訊檔案超過 Groq 25MB 上限，請分段錄音或上傳較短的檔案')
+
+    # 依副檔名對應正確的 MIME type（Groq 必須明確指定）
+    ext = os.path.splitext(file_path)[1].lower()
+    MIME_MAP = {
+        '.wav':  ('audio.wav',  'audio/wav'),
+        '.mp3':  ('audio.mp3',  'audio/mpeg'),
+        '.mp4':  ('audio.mp4',  'audio/mp4'),
+        '.m4a':  ('audio.m4a',  'audio/m4a'),
+        '.ogg':  ('audio.ogg',  'audio/ogg'),
+        '.webm': ('audio.webm', 'audio/webm'),
+        '.flac': ('audio.flac', 'audio/flac'),
+        '.opus': ('audio.opus', 'audio/opus'),
+        '.mpeg': ('audio.mpeg', 'audio/mpeg'),
+        '.mpga': ('audio.mpga', 'audio/mpeg'),
+    }
+    fname, mime = MIME_MAP.get(ext, ('audio.wav', 'audio/wav'))
+
     with open(file_path, 'rb') as f:
         result = client.audio.transcriptions.create(
             model=model,
-            file=f,
+            file=(fname, f, mime),   # (filename, fileobj, mimetype) tuple
             response_format='text',
         )
     return result if isinstance(result, str) else result.text
@@ -311,6 +379,76 @@ def api_transcribe():
             pass
 
 
+@app.route('/api/transcribe_rt', methods=['POST'])
+@login_required
+def api_transcribe_rt():
+    """即時錄音分段轉譯端點（HTTP POST，比 WebSocket 更可靠傳輸二進位音訊）"""
+    api_key = request.form.get('api_key', '').strip()
+    if not api_key:
+        return jsonify({'error': '請輸入 Groq API Key'}), 400
+
+    if 'file' not in request.files:
+        return jsonify({'error': '未收到音訊檔案'}), 400
+
+    f = request.files['file']
+    if f.filename == '' or f.content_length == 0:
+        return jsonify({'error': '音訊檔案為空'}), 400
+
+    langs = [l.strip() for l in request.form.get('languages', 'zh,en,ja').split(',') if l.strip()]
+
+    # 取得副檔名（依瀏覽器送來的 filename 或 MIME type 決定）
+    original_name = f.filename or 'chunk.webm'
+    ext = os.path.splitext(original_name)[1].lower()
+    if not ext or ext not in ('.webm', '.wav', '.mp3', '.ogg', '.mp4', '.opus', '.flac', '.m4a'):
+        mime = f.content_type or ''
+        if 'ogg' in mime:
+            ext = '.ogg'
+        elif 'wav' in mime:
+            ext = '.wav'
+        elif 'mp4' in mime:
+            ext = '.mp4'
+        else:
+            ext = '.webm'
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        f.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        file_size = os.path.getsize(tmp_path)
+        logging.info(f"RT chunk: {file_size} bytes, ext={ext}, langs={langs}")
+
+        if file_size < 300:
+            return jsonify({'error': f'音訊太短（{file_size} bytes），請稍後再試', 'skip': True}), 200
+
+        client = Groq(api_key=api_key)
+        orig = do_transcribe(client, tmp_path, fast=True)
+
+        if not orig or not orig.strip():
+            return jsonify({'text': '', 'translations': {}, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+
+        translations = {}
+        for lang in langs:
+            if lang in LANG_NAMES:
+                translations[lang] = do_translate(client, orig, lang)
+
+        return jsonify({
+            'success': True,
+            'text': orig.strip(),
+            'translations': translations,
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+        })
+
+    except Exception as e:
+        logging.exception("RT transcription error")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 @app.route('/api/summarize', methods=['POST'])
 @login_required
 def api_summarize():
@@ -448,7 +586,18 @@ def ws_audio_chunk(data):
 
     try:
         audio_bytes = base64.b64decode(audio_b64)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp:
+
+        # 自動偵測格式（WebM magic bytes: 1A 45 DF A3）
+        suffix = '.webm'
+        if len(audio_bytes) >= 4:
+            if audio_bytes[:4] in (b'RIFF', b'riff'):
+                suffix = '.wav'
+            elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+                suffix = '.mp3'
+            elif audio_bytes[:4] == b'OggS':
+                suffix = '.ogg'
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 

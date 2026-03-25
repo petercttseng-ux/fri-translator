@@ -385,25 +385,113 @@ body {
 }
 
 /* ════════════════════════════════════════════
-   RESULT TABS
+   MULTI-LANGUAGE PARALLEL GRID
    ════════════════════════════════════════════ */
 
-.result-lang-tabs .nav-link {
-  font-size: .85rem;
-  color: #495057;
-  border-radius: 8px 8px 0 0;
-  padding: .4rem .9rem;
-  transition: var(--transition);
+/* 4 欄並排（桌機） → 2 欄（平板） → 1 欄（手機） */
+.multi-lang-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: .75rem;
+  align-items: start;
 }
-.result-lang-tabs .nav-link.active {
-  color: var(--fri-teal-dark);
-  font-weight: 700;
-  border-bottom-color: #fff;
+@media (max-width: 1199px) {
+  .multi-lang-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 575px) {
+  .multi-lang-grid { grid-template-columns: 1fr; }
 }
 
+/* 語言欄卡片 */
+.lang-col-card {
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid #e0eeec;
+  box-shadow: 0 2px 10px rgba(26,158,142,.1);
+  display: flex;
+  flex-direction: column;
+  transition: box-shadow var(--transition);
+}
+.lang-col-card:hover {
+  box-shadow: 0 4px 18px rgba(26,158,142,.2);
+}
+
+/* 欄標題列 */
+.lang-col-header {
+  padding: .55rem 1rem;
+  font-size: .8rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  letter-spacing: .3px;
+  border-bottom: 2px solid rgba(255,255,255,.25);
+}
+
+/* 各語言顏色 */
+.lang-col-orig .lang-col-header {
+  background: linear-gradient(135deg, #1a9e8e, #0d6e62);
+  color: #fff;
+}
+.lang-col-zh .lang-col-header {
+  background: linear-gradient(135deg, #c0392b, #7b241c);
+  color: #fff;
+}
+.lang-col-en .lang-col-header {
+  background: linear-gradient(135deg, #2471a3, #154360);
+  color: #fff;
+}
+.lang-col-ja .lang-col-header {
+  background: linear-gradient(135deg, #e74c3c, #a93226);
+  color: #fff;
+}
+
+/* 欄內文字區 */
+.lang-col-body {
+  padding: .9rem 1rem;
+  flex: 1;
+  font-size: .88rem;
+  line-height: 1.9;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 200px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: #fff;
+  color: var(--fri-text);
+}
+
+/* 即時更新閃爍動畫 */
+@keyframes flash-update {
+  0%   { background: #d4f5f0; }
+  100% { background: #fff; }
+}
+.lang-col-body.updating {
+  animation: flash-update .5s ease forwards;
+}
+
+/* 欄內複製按鈕 */
+.btn-col-copy {
+  border: none;
+  background: rgba(255,255,255,.22);
+  color: rgba(255,255,255,.9);
+  border-radius: 6px;
+  padding: .15rem .45rem;
+  font-size: .72rem;
+  cursor: pointer;
+  margin-left: auto;
+  transition: background var(--transition);
+  flex-shrink: 0;
+}
+.btn-col-copy:hover {
+  background: rgba(255,255,255,.4);
+  color: #fff;
+}
+
+/* 舊版 result-text-box 相容保留（歷史記錄用） */
 .result-text-box {
   border: 1px solid #d0e8e5;
-  border-radius: 0 0 10px 10px;
+  border-radius: 10px;
   padding: 1rem;
   min-height: 140px;
   max-height: 400px;

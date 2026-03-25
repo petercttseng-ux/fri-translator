@@ -188,16 +188,58 @@
             </button>
           </div>
 
-          <!-- Live transcription display -->
-          <div class="transcript-block" id="rtTranscriptBlock">
-            <div class="transcript-label">
-              <i class="bi bi-mic me-1"></i>即時逐字稿
-              <span class="badge bg-success ms-1 d-none" id="rtLiveBadge">● LIVE</span>
+          <!-- ── 即時多語並排顯示 ── -->
+          <div class="multi-lang-grid" id="rtMultiLang">
+            <!-- 原始逐字稿 -->
+            <div class="lang-col-card lang-col-orig">
+              <div class="lang-col-header">
+                <i class="bi bi-mic-fill me-1"></i>原始逐字稿
+                <span class="badge bg-light text-dark ms-1 d-none" id="rtLiveBadge" style="font-size:.65rem">● LIVE</span>
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('rtColOrig')" title="複製">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="rtColOrig">
+                <span class="text-muted fst-italic">逐字稿將在此即時顯示…</span>
+              </div>
             </div>
-            <div id="rtTranscript" class="transcript-text" contenteditable="false">
-              <span class="text-muted fst-italic">逐字稿將在此即時顯示…</span>
+            <!-- 繁體中文 -->
+            <div class="lang-col-card lang-col-zh" id="rtCardZh">
+              <div class="lang-col-header">
+                🇹🇼 繁體中文
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('rtColZh')" title="複製">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="rtColZh">
+                <span class="text-muted fst-italic">中文譯文將在此顯示…</span>
+              </div>
             </div>
-          </div>
+            <!-- English -->
+            <div class="lang-col-card lang-col-en" id="rtCardEn">
+              <div class="lang-col-header">
+                🇺🇸 English
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('rtColEn')" title="Copy">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="rtColEn">
+                <span class="text-muted fst-italic">English translation will appear here…</span>
+              </div>
+            </div>
+            <!-- 日本語 -->
+            <div class="lang-col-card lang-col-ja" id="rtCardJa">
+              <div class="lang-col-header">
+                🇯🇵 日本語
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('rtColJa')" title="コピー">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="rtColJa">
+                <span class="text-muted fst-italic">日本語訳はここに表示されます…</span>
+              </div>
+            </div>
+          </div><!-- end rtMultiLang -->
         </div>
       </div>
 
@@ -289,25 +331,57 @@
             </div>
           </div>
 
-          <!-- Language tabs -->
-          <ul class="nav nav-tabs result-lang-tabs mb-3" id="langTabs">
-            <li class="nav-item">
-              <button class="nav-link active" data-lang="orig">
+          <!-- ── 結果多語並排顯示 ── -->
+          <div class="multi-lang-grid" id="resultMultiLang">
+            <!-- 原始逐字稿 -->
+            <div class="lang-col-card lang-col-orig">
+              <div class="lang-col-header">
                 <i class="bi bi-file-text me-1"></i>原始逐字稿
-              </button>
-            </li>
-            <li class="nav-item" id="tabZh">
-              <button class="nav-link" data-lang="zh">🇹🇼 中文</button>
-            </li>
-            <li class="nav-item" id="tabEn">
-              <button class="nav-link" data-lang="en">🇺🇸 English</button>
-            </li>
-            <li class="nav-item" id="tabJa">
-              <button class="nav-link" data-lang="ja">🇯🇵 日本語</button>
-            </li>
-          </ul>
-
-          <div id="langContent" class="result-text-box"></div>
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('colOrig')" title="複製">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="colOrig">
+                <span class="text-muted fst-italic">（尚無內容）</span>
+              </div>
+            </div>
+            <!-- 繁體中文 -->
+            <div class="lang-col-card lang-col-zh" id="resultCardZh">
+              <div class="lang-col-header">
+                🇹🇼 繁體中文
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('colZh')" title="複製">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="colZh">
+                <span class="text-muted fst-italic">（尚無內容）</span>
+              </div>
+            </div>
+            <!-- English -->
+            <div class="lang-col-card lang-col-en" id="resultCardEn">
+              <div class="lang-col-header">
+                🇺🇸 English
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('colEn')" title="Copy">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="colEn">
+                <span class="text-muted fst-italic">(No content yet)</span>
+              </div>
+            </div>
+            <!-- 日本語 -->
+            <div class="lang-col-card lang-col-ja" id="resultCardJa">
+              <div class="lang-col-header">
+                🇯🇵 日本語
+                <button class="btn-col-copy ms-auto" onclick="copyColContent('colJa')" title="コピー">
+                  <i class="bi bi-clipboard"></i>
+                </button>
+              </div>
+              <div class="lang-col-body" id="colJa">
+                <span class="text-muted fst-italic">（まだコンテンツがありません）</span>
+              </div>
+            </div>
+          </div><!-- end resultMultiLang -->
         </div>
 
         <!-- AI Summary -->

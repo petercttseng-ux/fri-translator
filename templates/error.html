@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}系統錯誤 - 水試所多國語音轉譯小幫手{% endblock %}
+
+{% block body %}
+<div class="auth-wrapper">
+  <div class="auth-card text-center" style="max-width:520px">
+    <div class="auth-header">
+      <img src="{{ url_for('static', filename='images/logo.jpg') }}" alt="農業部水產試驗所" class="auth-logo" />
+      <h1 class="auth-title" style="color:#dc3545;">⚠️ 系統錯誤</h1>
+      <p class="auth-subtitle">水試所多國語音轉譯小幫手</p>
+    </div>
+    <div class="alert alert-danger text-start">
+      <strong>錯誤訊息：</strong><br/>
+      <code>{{ error }}</code>
+    </div>
+    <a href="{{ url_for('login') }}" class="btn btn-primary mt-3">
+      <i class="bi bi-arrow-left me-2"></i>返回登入頁
+    </a>
+  </div>
+</div>
+{% endblock %}
