@@ -358,10 +358,22 @@ function encodeWAV(pcm, sampleRate) {
 }
 
 // ═══════════════════════════════════════════════
-// 即時錄音（Web Audio API → PCM → WAV → HTTP POST）
+// 即時錄音（MediaRecorder → webm/ogg → HTTP POST）
+// 每段由瀏覽器原生編碼，產生完整可解碼的音訊檔案
 // ═══════════════════════════════════════════════
-const RT_SAMPLE_RATE = 16000;   // 16kHz — Whisper 最佳輸入取樣率
-const SEGMENT_SECS   = 9;       // 每 9 秒送出一段
+const SEGMENT_SECS = 12;   // 每 12 秒送出一段
+
+/** 選出瀏覽器支援的最佳 MIME type */
+function getBestMimeType() {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/ogg;codecs=opus',
+    'audio/webm',
+    'audio/ogg',
+    'audio/mp4',
+  ];
+  return candidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+}
 
 async function startRecording() {
   if (!STATE.apiKey) {
@@ -372,17 +384,20 @@ async function startRecording() {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
     });
-    STATE.stream      = stream;
-    STATE.isRecording = true;
-    STATE.pcmBuffer   = [];
+    STATE.stream          = stream;
+    STATE.isRecording     = true;
     STATE.accTranscript   = '';
     STATE.accTranslations = { zh: '', en: '', ja: '' };
     STATE.recSeconds      = 0;
 
-    // 清空四欄
+    // 強制顯示所有即時欄位
+    ['rtCardZh','rtCardEn','rtCardJa'].forEach(id => {
+      const el = $(id); if (el) el.style.display = '';
+    });
+    // 清空四欄，顯示等待指示器
     ['rtColOrig','rtColZh','rtColEn','rtColJa'].forEach(id => {
       const el = $(id);
-      if (el) el.innerHTML = '<span class="text-muted fst-italic">等待語音輸入…</span>';
+      if (el) el.innerHTML = '<span class="text-muted fst-italic streaming-placeholder">等待語音輸入…</span>';
     });
 
     $('rtLiveBadge').classList.remove('d-none');
@@ -391,7 +406,7 @@ async function startRecording() {
     $('rtStatus').textContent = '錄音中';
     $('rtStatus').className   = 'badge bg-danger';
     $('rtTimer').classList.remove('d-none');
-    $('waveformIdle').style.display  = 'none';
+    $('waveformIdle').style.display   = 'none';
     $('waveformCanvas').style.display = 'block';
 
     // 計時器
@@ -402,45 +417,18 @@ async function startRecording() {
       $('rtTimer').textContent = `${m}:${s}`;
     }, 1000);
 
-    // ── AudioContext（共用：錄音 + 波形）──
+    // ── AudioContext（僅用於波形視覺化）──
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     STATE.audioCtx  = new AudioCtx();
-    const srcNode   = STATE.audioCtx.createMediaStreamSource(stream);
-
-    // 波形分析器
+    await STATE.audioCtx.resume();
+    const srcNode = STATE.audioCtx.createMediaStreamSource(stream);
     STATE.analyser = STATE.audioCtx.createAnalyser();
     STATE.analyser.fftSize = 256;
     srcNode.connect(STATE.analyser);
-
-    // ScriptProcessor 捕捉 PCM（已標記棄用但各瀏覽器仍完整支援）
-    const bufSize    = 4096;
-    STATE.scriptProc = STATE.audioCtx.createScriptProcessor(bufSize, 1, 1);
-    const nativeSR   = STATE.audioCtx.sampleRate;
-    const ratio      = nativeSR / RT_SAMPLE_RATE;
-
-    STATE.scriptProc.onaudioprocess = e => {
-      if (!STATE.isRecording) return;
-      const raw = e.inputBuffer.getChannelData(0);
-      // 降取樣至 16kHz
-      if (ratio > 1.01) {
-        const len = Math.floor(raw.length / ratio);
-        const ds  = new Float32Array(len);
-        for (let i = 0; i < len; i++) ds[i] = raw[Math.round(i * ratio)];
-        STATE.pcmBuffer.push(ds);
-      } else {
-        STATE.pcmBuffer.push(new Float32Array(raw));
-      }
-    };
-
-    srcNode.connect(STATE.scriptProc);
-    STATE.scriptProc.connect(STATE.audioCtx.destination);   // 靜音輸出（必須連接才能觸發）
-
     drawWaveform();
 
-    // 定時送出分段
-    STATE.segmentTimer = setInterval(() => {
-      if (STATE.isRecording) flushSegment();
-    }, SEGMENT_SECS * 1000);
+    // ── MediaRecorder（錄音 + 原生編碼）──
+    startMediaSegment(stream);
 
   } catch (err) {
     STATE.isRecording = false;
@@ -448,34 +436,62 @@ async function startRecording() {
   }
 }
 
-/** 合併 pcmBuffer → WAV → HTTP POST */
-function flushSegment() {
-  if (!STATE.pcmBuffer || STATE.pcmBuffer.length === 0) return;
+/**
+ * 開始一段錄音（stop 後自動開始下一段，形成連續分段）
+ * 每段都是完整的 webm/ogg 檔案，Groq 可獨立解碼。
+ */
+function startMediaSegment(stream) {
+  if (!STATE.isRecording) return;
 
-  const totalLen = STATE.pcmBuffer.reduce((s, a) => s + a.length, 0);
-  if (totalLen < RT_SAMPLE_RATE * 0.8) return;   // < 0.8 秒跳過
+  const mimeType = getBestMimeType();
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+  } catch (e) {
+    recorder = new MediaRecorder(stream);
+  }
+  STATE.currentRecorder = recorder;
+  const chunks = [];
 
-  const merged = new Float32Array(totalLen);
-  let off = 0;
-  for (const chunk of STATE.pcmBuffer) { merged.set(chunk, off); off += chunk.length; }
-  STATE.pcmBuffer = [];
+  recorder.ondataavailable = e => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
 
-  const wavBlob = encodeWAV(merged, RT_SAMPLE_RATE);
-  sendChunkHTTP(wavBlob);   // 非同步，不等待
+  recorder.onstop = () => {
+    if (chunks.length > 0) {
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      console.log(`[FRI] 片段: ${(blob.size/1024).toFixed(1)} KB, type=${blob.type}`);
+      if (blob.size > 3000) {
+        sendChunkHTTP(blob);
+      } else {
+        console.log('[FRI] 片段太小，跳過');
+      }
+    }
+    // 若仍在錄音，自動開始下一段
+    if (STATE.isRecording) startMediaSegment(stream);
+  };
+
+  recorder.start();
+  console.log(`[FRI] MediaRecorder 啟動，mimeType=${recorder.mimeType}`);
+
+  // N 秒後停止（觸發 onstop → 送出 → 開始下一段）
+  STATE.segmentTimer = setTimeout(() => {
+    if (recorder.state === 'recording') recorder.stop();
+  }, SEGMENT_SECS * 1000);
 }
 
 function stopRecording() {
   if (!STATE.isRecording) return;
   STATE.isRecording = false;
 
-  clearInterval(STATE.segmentTimer); STATE.segmentTimer = null;
+  clearTimeout(STATE.segmentTimer); STATE.segmentTimer = null;
   clearInterval(STATE.recInterval);
 
-  // 送出最後剩餘片段
-  flushSegment();
-
-  // 釋放 ScriptProcessor
-  if (STATE.scriptProc) { STATE.scriptProc.disconnect(); STATE.scriptProc = null; }
+  // 停止當前 MediaRecorder（onstop 會送出最後一段）
+  if (STATE.currentRecorder && STATE.currentRecorder.state === 'recording') {
+    STATE.currentRecorder.stop();
+  }
+  STATE.currentRecorder = null;
 
   // 關閉 AudioContext
   if (STATE.audioCtx)  { STATE.audioCtx.close(); STATE.audioCtx = null; }
@@ -494,33 +510,60 @@ function stopRecording() {
   $('waveformIdle').style.display   = '';
   $('waveformCanvas').style.display = 'none';
 
-  if (STATE.accTranscript) {
-    // 強制顯示全部即時翻譯欄位
-    ['rtCardZh','rtCardEn','rtCardJa'].forEach(id => {
-      const el = $(id); if (el) el.style.display = '';
-    });
-    showResults({ original: STATE.accTranscript, translations: STATE.accTranslations });
-  }
+  // 移除處理中動畫
+  const rtGrid = $('rtMultiLang');
+  if (rtGrid) rtGrid.classList.remove('rt-processing');
+
+  // 等待最後一段 onstop 觸發後才彙整結果（delay 1.5s）
+  setTimeout(() => {
+    if (STATE.accTranscript) {
+      ['rtCardZh','rtCardEn','rtCardJa'].forEach(id => {
+        const el = $(id); if (el) el.style.display = '';
+      });
+      showResults({ original: STATE.accTranscript, translations: STATE.accTranslations });
+    }
+  }, 1500);
 }
 
-/** HTTP POST 上傳 WAV 分段 */
+/** HTTP POST 上傳音訊分段（webm / ogg / wav 皆可） */
 async function sendChunkHTTP(blob) {
+  // 增加活躍送出計數
+  STATE._sendingCount = (STATE._sendingCount || 0) + 1;
   try {
     if (STATE.isRecording) {
       $('rtStatus').textContent = '轉譯中…';
       $('rtStatus').className   = 'badge bg-warning text-dark';
     }
+    // 在即時欄顯示處理中指示
+    const rtGrid = $('rtMultiLang');
+    if (rtGrid) rtGrid.classList.add('rt-processing');
+
+    // 根據 blob 的 MIME type 決定副檔名，讓後端正確識別格式
+    const mimeToExt = {
+      'audio/webm': 'webm', 'audio/ogg': 'ogg',
+      'audio/mp4': 'mp4',   'audio/wav': 'wav',
+      'audio/mpeg': 'mp3',
+    };
+    const baseMime = (blob.type || 'audio/webm').split(';')[0].trim();
+    const ext = mimeToExt[baseMime] || 'webm';
+    const filename = `chunk.${ext}`;
 
     const form = new FormData();
-    form.append('file',      blob, 'chunk.wav');
+    form.append('file',      blob, filename);
     form.append('api_key',   STATE.apiKey);
     form.append('languages', getSelectedLangs().join(','));
 
+    console.log(`[FRI] 送出 WAV: ${blob.size} bytes`);
     const res  = await fetch('/api/transcribe_rt', { method: 'POST', body: form });
     const data = await res.json();
 
     if (data.error && !data.skip) {
-      showToast('⚠️ ' + data.error, 'danger');
+      showToast('轉譯錯誤：' + data.error, 'danger');
+      console.error('[FRI] Groq error:', data.error);
+      return;
+    }
+    if (data.skip) {
+      console.log('[FRI] 片段被跳過:', data.error);
       return;
     }
 
@@ -540,11 +583,20 @@ async function sendChunkHTTP(blob) {
       }
     }
 
-    if (text) showToast(`[${data.timestamp || ''}] 片段轉譯完成 ✓`, 'success');
+    if (text) {
+      const ts = data.timestamp || '';
+      showToast(`[${ts}] 片段轉譯完成`, 'success');
+    }
 
   } catch (err) {
+    console.error('[FRI] sendChunkHTTP error:', err);
     showToast('傳送失敗：' + err.message, 'danger');
   } finally {
+    STATE._sendingCount = Math.max(0, (STATE._sendingCount || 1) - 1);
+    if (STATE._sendingCount === 0) {
+      const rtGrid = $('rtMultiLang');
+      if (rtGrid) rtGrid.classList.remove('rt-processing');
+    }
     if (STATE.isRecording) {
       $('rtStatus').textContent = '錄音中';
       $('rtStatus').className   = 'badge bg-danger';

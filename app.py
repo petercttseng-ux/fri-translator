@@ -21,7 +21,10 @@ from groq import Groq
 from datetime import datetime
 import secrets
 import base64
+import io
+import struct
 import threading
+import wave
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, 'instance', 'users.db')
@@ -147,6 +150,78 @@ WHISPER_MODEL = 'whisper-large-v3'
 WHISPER_TURBO = 'whisper-large-v3-turbo'
 
 
+def _validate_wav(data: bytes) -> bool:
+    """驗證 WAV 檔案標頭是否有效"""
+    if len(data) < 44:
+        return False
+    if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+        return False
+    if data[12:16] != b'fmt ':
+        return False
+    return True
+
+
+def ensure_valid_wav(audio_bytes: bytes) -> bytes:
+    """使用 Python wave 模組解析並重新編碼 WAV，確保格式 100% 合規"""
+    buf = io.BytesIO(audio_bytes)
+    try:
+        with wave.open(buf, 'rb') as wf:
+            nch   = wf.getnchannels()
+            sw    = wf.getsampwidth()
+            rate  = wf.getframerate()
+            nfr   = wf.getnframes()
+            frames = wf.readframes(nfr)
+    except Exception as e:
+        raise ValueError(f'WAV 解析失敗：{e}（header={audio_bytes[:12].hex()}）')
+
+    if nfr < 800:   # 少於 ~0.05 秒 @ 16kHz
+        raise ValueError(f'音訊片段太短（{nfr} frames @ {rate}Hz）')
+
+    out = io.BytesIO()
+    with wave.open(out, 'wb') as wf:
+        wf.setnchannels(nch)
+        wf.setsampwidth(sw)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    result = out.getvalue()
+    logging.info(f'WAV re-encoded: {len(audio_bytes)}→{len(result)} bytes, '
+                 f'{nch}ch {rate}Hz {sw*8}bit {nfr}frames '
+                 f'({nfr/rate:.1f}s)')
+    return result
+
+
+def _wav_rms(data: bytes) -> float:
+    """計算 WAV 音訊的 RMS 值（偵測是否靜音）"""
+    try:
+        pcm_start = 44  # 標準 WAV header
+        if len(data) <= pcm_start + 100:
+            return 0.0
+        pcm = data[pcm_start:]
+        n_samples = len(pcm) // 2
+        if n_samples == 0:
+            return 0.0
+        total = 0.0
+        for i in range(0, min(n_samples * 2, len(pcm)) - 1, 2):
+            sample = struct.unpack_from('<h', pcm, i)[0]
+            total += sample * sample
+        return (total / n_samples) ** 0.5
+    except Exception:
+        return 1.0  # 無法計算時不阻擋
+
+
+def do_transcribe_bytes(client: Groq, audio_bytes: bytes, filename: str = 'audio.wav',
+                        mime: str = 'audio/wav', fast: bool = False) -> str:
+    """直接從記憶體 bytes 送至 Groq Whisper（避免 Windows tempfile 鎖定問題）"""
+    model = WHISPER_TURBO if fast else WHISPER_MODEL
+    buf = io.BytesIO(audio_bytes)
+    result = client.audio.transcriptions.create(
+        model=model,
+        file=(filename, buf, mime),
+        response_format='text',
+    )
+    return result if isinstance(result, str) else result.text
+
+
 def do_transcribe(client: Groq, file_path: str, fast: bool = False) -> str:
     model = WHISPER_TURBO if fast else WHISPER_MODEL
 
@@ -173,13 +248,11 @@ def do_transcribe(client: Groq, file_path: str, fast: bool = False) -> str:
     }
     fname, mime = MIME_MAP.get(ext, ('audio.wav', 'audio/wav'))
 
+    # 讀入記憶體後送出（避免 Windows 檔案鎖定問題）
     with open(file_path, 'rb') as f:
-        result = client.audio.transcriptions.create(
-            model=model,
-            file=(fname, f, mime),   # (filename, fileobj, mimetype) tuple
-            response_format='text',
-        )
-    return result if isinstance(result, str) else result.text
+        audio_bytes = f.read()
+
+    return do_transcribe_bytes(client, audio_bytes, fname, mime, fast)
 
 
 def do_translate(client: Groq, text: str, target_lang: str) -> str:
@@ -349,9 +422,11 @@ def api_transcribe():
     langs = [l.strip() for l in request.form.get('languages', 'zh,en,ja').split(',') if l.strip()]
 
     ext = os.path.splitext(f.filename)[1].lower() or '.wav'
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
+    # Windows: 先關閉 tempfile 再寫入，避免檔案鎖定
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    tmp_path = tmp.name
+    tmp.close()
+    f.save(tmp_path)
 
     try:
         client = Groq(api_key=api_key)
@@ -401,7 +476,7 @@ def api_transcribe():
 @app.route('/api/transcribe_rt', methods=['POST'])
 @login_required
 def api_transcribe_rt():
-    """即時錄音分段轉譯端點（HTTP POST，比 WebSocket 更可靠傳輸二進位音訊）"""
+    """即時錄音分段轉譯端點 — 支援 webm/ogg（MediaRecorder）與 wav"""
     api_key = request.form.get('api_key', '').strip()
     if not api_key:
         return jsonify({'error': '請輸入 Groq API Key'}), 400
@@ -410,41 +485,61 @@ def api_transcribe_rt():
         return jsonify({'error': '未收到音訊檔案'}), 400
 
     f = request.files['file']
-    if f.filename == '' or f.content_length == 0:
-        return jsonify({'error': '音訊檔案為空'}), 400
+    audio_bytes = f.read()
+    if not audio_bytes or len(audio_bytes) < 500:
+        return jsonify({'error': '音訊檔案為空', 'skip': True}), 200
 
     langs = [l.strip() for l in request.form.get('languages', 'zh,en,ja').split(',') if l.strip()]
+    file_size = len(audio_bytes)
+    magic = audio_bytes[:4]
+    logging.info(f"RT chunk: {file_size} bytes, magic={magic!r}, "
+                 f"filename={f.filename!r}, langs={langs}")
 
-    # 取得副檔名（依瀏覽器送來的 filename 或 MIME type 決定）
-    original_name = f.filename or 'chunk.webm'
-    ext = os.path.splitext(original_name)[1].lower()
-    if not ext or ext not in ('.webm', '.wav', '.mp3', '.ogg', '.mp4', '.opus', '.flac', '.m4a'):
-        mime = f.content_type or ''
-        if 'ogg' in mime:
-            ext = '.ogg'
-        elif 'wav' in mime:
-            ext = '.wav'
-        elif 'mp4' in mime:
-            ext = '.mp4'
+    # ── 格式偵測（依 magic bytes）──
+    if magic == b'RIFF':
+        # WAV：用 Python wave 模組重新編碼，確保格式合規
+        try:
+            audio_bytes = ensure_valid_wav(audio_bytes)
+        except ValueError as e:
+            logging.warning(f"WAV invalid, skip: {e}")
+            return jsonify({'error': str(e), 'skip': True}), 200
+        # 靜音偵測
+        rms = _wav_rms(audio_bytes)
+        logging.info(f"WAV RMS={rms:.1f}")
+        if rms < 30:
+            return jsonify({'error': '偵測到靜音，跳過', 'skip': True}), 200
+        fname, mime = 'audio.wav', 'audio/wav'
+
+    elif magic == b'OggS':
+        fname, mime = 'audio.ogg', 'audio/ogg'
+
+    elif magic[:4] in (b'\x1aE\xdf\xa3', b'\x1aE\xdf\xa4'):   # EBML/WebM
+        fname, mime = 'audio.webm', 'audio/webm'
+
+    elif len(audio_bytes) > 8 and audio_bytes[4:8] == b'ftyp':
+        fname, mime = 'audio.mp4', 'audio/mp4'
+
+    else:
+        # 依上傳檔名推測
+        fn = (f.filename or 'chunk.webm').lower()
+        if fn.endswith('.ogg'):
+            fname, mime = 'audio.ogg', 'audio/ogg'
+        elif fn.endswith('.mp4') or fn.endswith('.m4a'):
+            fname, mime = 'audio.mp4', 'audio/mp4'
+        elif fn.endswith('.wav'):
+            fname, mime = 'audio.wav', 'audio/wav'
         else:
-            ext = '.webm'
+            fname, mime = 'audio.webm', 'audio/webm'
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
+    logging.info(f"Sending to Groq: {fname} ({mime}), {len(audio_bytes)} bytes")
 
     try:
-        file_size = os.path.getsize(tmp_path)
-        logging.info(f"RT chunk: {file_size} bytes, ext={ext}, langs={langs}")
-
-        if file_size < 300:
-            return jsonify({'error': f'音訊太短（{file_size} bytes），請稍後再試', 'skip': True}), 200
-
         client = Groq(api_key=api_key)
-        orig = do_transcribe(client, tmp_path, fast=True)
+        orig = do_transcribe_bytes(client, audio_bytes, fname, mime, fast=True)
 
         if not orig or not orig.strip():
-            return jsonify({'text': '', 'translations': {}, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+            return jsonify({'text': '', 'translations': {},
+                            'timestamp': datetime.now().strftime('%H:%M:%S')})
 
         translations = {}
         for lang in langs:
@@ -453,19 +548,20 @@ def api_transcribe_rt():
 
         return jsonify({
             'success': True,
-            'text': orig.strip(),
+            'text':    orig.strip(),
             'translations': translations,
             'timestamp': datetime.now().strftime('%H:%M:%S'),
         })
 
     except Exception as e:
         logging.exception("RT transcription error")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        err_msg = str(e)
+        if '400' in err_msg and 'could not process' in err_msg:
+            logging.error(f"Groq rejected: size={file_size}, magic={magic!r}, "
+                          f"fname={fname}, header={audio_bytes[:16].hex()}")
+            err_msg = (f'Groq 無法辨識音訊格式（{fname}, {file_size} bytes）。'
+                       f'請確認麥克風正常後重新錄音。')
+        return jsonify({'error': err_msg}), 500
 
 
 @app.route('/api/summarize', methods=['POST'])
@@ -606,39 +702,33 @@ def ws_audio_chunk(data):
     try:
         audio_bytes = base64.b64decode(audio_b64)
 
+        if len(audio_bytes) < 200:
+            emit('ws_error', {'message': '音訊資料太短'})
+            return
+
         # 自動偵測格式（WebM magic bytes: 1A 45 DF A3）
-        suffix = '.webm'
-        if len(audio_bytes) >= 4:
-            if audio_bytes[:4] in (b'RIFF', b'riff'):
-                suffix = '.wav'
-            elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
-                suffix = '.mp3'
-            elif audio_bytes[:4] == b'OggS':
-                suffix = '.ogg'
+        if audio_bytes[:4] in (b'RIFF', b'riff'):
+            fname, mime = 'audio.wav', 'audio/wav'
+        elif audio_bytes[:4] == b'OggS':
+            fname, mime = 'audio.ogg', 'audio/ogg'
+        elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+            fname, mime = 'audio.mp3', 'audio/mpeg'
+        else:
+            fname, mime = 'audio.webm', 'audio/webm'
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
+        client = Groq(api_key=api_key)
+        orig = do_transcribe_bytes(client, audio_bytes, fname, mime, fast=True)
 
-        try:
-            client = Groq(api_key=api_key)
-            orig = do_transcribe(client, tmp_path, fast=True)
+        translations = {}
+        for lang in langs:
+            if lang in LANG_NAMES:
+                translations[lang] = do_translate(client, orig, lang)
 
-            translations = {}
-            for lang in langs:
-                if lang in LANG_NAMES:
-                    translations[lang] = do_translate(client, orig, lang)
-
-            emit('transcription_result', {
-                'text': orig,
-                'translations': translations,
-                'timestamp': datetime.now().strftime('%H:%M:%S'),
-            })
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        emit('transcription_result', {
+            'text': orig,
+            'translations': translations,
+            'timestamp': datetime.now().strftime('%H:%M:%S'),
+        })
 
     except Exception as e:
         emit('ws_error', {'message': str(e)})
